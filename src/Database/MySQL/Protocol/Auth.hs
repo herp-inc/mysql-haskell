@@ -144,6 +144,26 @@ putAuth (Auth cap m c n p s) = do
     putByteString p
     putByteString s
     putWord8 0x00
+    putByteString "caching_sha2_password"
+    putWord8 0x00
+
+data RequestPubKey = RequestPubKey deriving (Show, Eq)
+
+putRequestPubKey :: RequestPubKey -> Put
+putRequestPubKey _ = putWord8 0x02
+
+instance Binary RequestPubKey where
+    put = putRequestPubKey
+    get = pure RequestPubKey
+
+data SendEncryptedPassword = SendEncryptedPassword !ByteString deriving (Show, Eq)
+
+putSendEncryptedPassword :: SendEncryptedPassword -> Put
+putSendEncryptedPassword (SendEncryptedPassword p) = putByteString p
+
+instance Binary SendEncryptedPassword where
+    put = putSendEncryptedPassword
+    get = SendEncryptedPassword <$> getByteStringNul
 
 instance Binary Auth where
     get = getAuth
@@ -182,6 +202,7 @@ clientCap =  CLIENT_LONG_PASSWORD
                 .|. CLIENT_MULTI_STATEMENTS
                 .|. CLIENT_MULTI_RESULTS
                 .|. CLIENT_SECURE_CONNECTION
+                .|. CLIENT_PLUGIN_AUTH
 
 clientMaxPacketSize :: Word32
 clientMaxPacketSize = 0x00ffffff :: Word32
