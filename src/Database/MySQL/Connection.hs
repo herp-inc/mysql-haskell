@@ -15,8 +15,12 @@ module Database.MySQL.Connection where
 
 import           Control.Exception               (Exception, bracketOnError,
                                                   throwIO, catch, SomeException)
+import Crypto.Hash.Algorithms (SHA1 (..))
 import           Control.Monad
 import qualified Crypto.Hash                     as Crypto
+import qualified Crypto.Store.X509               as X509
+import qualified Data.X509 as X509
+import qualified Crypto.PubKey.RSA.OAEP as RSA
 import qualified Data.Binary                     as Binary
 import qualified Data.Binary.Put                 as Binary
 import           Data.Bits
@@ -116,6 +120,28 @@ connectDetail (ConnectInfo host port db user pass charset)
         greet <- decodeFromPacket p
         let auth = mkAuth db user pass charset greet
         write c $ encodeToPacket 1 auth
+        p2 <- readPacket is'
+        if pBody p2 == "\x01\x04" -- Full authentication
+        then do
+            -- TODO: unix socketやTLSを使っている場合は別の処理が必要
+            write c $ encodeToPacket 3 RequestPubKey
+            p3 <- readPacket is'
+            let textKey = L.toStrict $ L.drop 1 (pBody p3)
+            let keys = X509.readPubKeyFileFromMemory textKey
+            let pubkey = case keys of
+                    [X509.PubKeyRSA key] -> key
+                    _ -> error "Invalid RSA key"
+            let nonce = greetingSalt1 greet `B.append` greetingSalt2 greet
+            let xorPass = B.pack $ zipWith xor (B.unpack (B.append pass "\0")) (cycle (B.unpack nonce))
+            eEncrypted <- RSA.encrypt (RSA.defaultOAEPParams SHA1) pubkey xorPass
+            let encrypted = case eEncrypted of
+                    Left err -> error $ show err
+                    Right enc -> enc
+            write c $ encodeToPacket 5 $ SendEncryptedPassword encrypted
+            pure ()
+        else if pBody p2 == "\01\x03" -- Fast authentication OK
+        then pure ()
+        else throwIO (UnexpectedPacket p2)
         q <- readPacket is'
         if isOK q
         then do
@@ -136,18 +162,18 @@ connectDetail (ConnectInfo host port db user pass charset)
 mkAuth :: ByteString -> ByteString -> ByteString -> Word8 -> Greeting -> Auth
 mkAuth db user pass charset greet =
     let salt = greetingSalt1 greet `B.append` greetingSalt2 greet
-        scambleBuf = scramble salt pass
+        scambleBuf = scrambleSha256 salt pass
     in Auth clientCap clientMaxPacketSize charset user scambleBuf db
-  where
-    scramble :: ByteString -> ByteString -> ByteString
-    scramble salt pass'
-        | B.null pass' = B.empty
-        | otherwise   = B.pack (B.zipWith xor sha1pass withSalt)
-        where sha1pass = sha1 pass'
-              withSalt = sha1 (salt `B.append` sha1 sha1pass)
 
-    sha1 :: ByteString -> ByteString
-    sha1 = BA.convert . (Crypto.hash :: ByteString -> Crypto.Digest Crypto.SHA1)
+scrambleSha256 :: ByteString -> ByteString -> ByteString
+scrambleSha256 salt pass
+    | B.null pass = B.empty
+    | otherwise   = B.pack (B.zipWith xor sha256pass withSalt256)
+    where sha256pass = sha256 pass
+          withSalt256 = sha256_2 (sha256 sha256pass) salt
+          sha256 = BA.convert . (Crypto.hash :: ByteString -> Crypto.Digest Crypto.SHA256)
+          sha256_2 bytes1 bytes2 = BA.convert $ Crypto.hashFinalize (Crypto.hashUpdate (Crypto.hashUpdate (Crypto.hashInit :: Crypto.Context Crypto.SHA256) bytes1) bytes2)
+
 
 -- | A specialized 'decodeInputStream' here for speed
 decodeInputStream :: InputStream ByteString -> IO (InputStream Packet)
