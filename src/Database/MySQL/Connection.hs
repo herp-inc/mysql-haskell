@@ -140,8 +140,22 @@ connectDetail (ConnectInfo host port db user pass charset)
             write c $ encodeToPacket 5 $ SendEncryptedPassword encrypted
             pure ()
         else if pBody p2 == "\01\x03" -- Fast authentication OK
-        then pure ()
-        else throwIO (UnexpectedPacket p2)
+        then do pure ()
+        else if isEOF p2 -- Prefix: 0xfe. Authentication switch request
+        then do
+            let getAuthSwitchReq = do
+                    _ <- Binary.getWord8 -- 0xfe
+                    pluginName <- getByteStringNul
+                    salt <- getByteStringNul
+                    pure (pluginName, salt)
+            (pluginName, salt) <- getFromPacket getAuthSwitchReq p2
+            unless (pluginName == "mysql_native_password") $
+                error $ "Unsupported auth plugin: " ++ show pluginName
+
+            write c $ putToPacket 3 $ Binary.putByteString (scramble salt pass)
+            pure ()
+        else do
+            throwIO (UnexpectedPacket p2)
         q <- readPacket is'
         if isOK q
         then do
@@ -164,6 +178,16 @@ mkAuth db user pass charset greet =
     let salt = greetingSalt1 greet `B.append` greetingSalt2 greet
         scambleBuf = scrambleSha256 salt pass
     in Auth clientCap clientMaxPacketSize charset user scambleBuf db
+
+scramble :: ByteString -> ByteString -> ByteString
+scramble salt pass'
+    | B.null pass' = B.empty
+    | otherwise   = B.pack (B.zipWith xor sha1pass withSalt)
+    where sha1pass = sha1 pass'
+          withSalt = sha1 (salt `B.append` sha1 sha1pass)
+
+sha1 :: ByteString -> ByteString
+sha1 = BA.convert . (Crypto.hash :: ByteString -> Crypto.Digest Crypto.SHA1)
 
 scrambleSha256 :: ByteString -> ByteString -> ByteString
 scrambleSha256 salt pass
